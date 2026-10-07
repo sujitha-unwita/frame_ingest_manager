@@ -1,0 +1,137 @@
+CODE REVIEW NOTES
+Review date: 2026-10-03
+Project: Integrated textile detection and telemetry application
+
+SCOPE
+Read-only review of the main application paths. No application code was modified.
+These findings reflect the code reviewed on this date, not an exhaustive guarantee
+that every possible defect has been identified. Runtime reproductions used offline
+inputs or mocks; live hardware, GPU inference, PostgreSQL and S3 integration were
+not validated.
+
+APPLICATION FLOW
+MCU telemetry -> control process -> vision worker -> audit worker -> database/S3
+-> dashboard.
+
+Control: serial communication, heartbeat monitoring, commands and ACKs.
+Vision: assigns folder images to cameras, runs tiled YOLO inference and maps
+        detections into physical coordinates.
+Audit: stores images and raw detections, merges overlapping defects, grades them
+       and assigns final defect numbers.
+Dashboard: operator commands, status updates, live events and HTTP replay.
+Runtime: starts workers, manages queues and supervises shutdown.
+
+FINDINGS, IN PRIORITY ORDER
+
+1. CRITICAL: VALID TELEMETRY IS DISCARDED
+The decoder expects a 19-byte payload, but the default payload-length table says
+14 bytes. McuLink does not pass the YAML payload-length override to its parser,
+so this affects the actual service. Heartbeats can continue working while
+inference receives no triggers.
+Evidence: reproduced using the production parser; valid telemetry returned no
+messages. The existing telemetry test errored for all three direction cases.
+References: control_service/protocol.py:62; control_service/mcu_link.py:231.
+
+2. STOP CANNOT INTERRUPT A PENDING START ON THE SAME WEBSOCKET
+The WebSocket handler waits for Start to finish before reading the next command.
+During slow roll preparation, Stop remains unread. Start can therefore send
+Resume before Stop is handled. The orchestrator's cancellation logic does not
+protect this normal panel path, although concurrent calls through other requests
+can reach that logic.
+Evidence: reproduced with the actual WebSocket endpoint and a mock socket;
+Stop remained pending until Start was released.
+Reference: dashboard_service/routers/websocket.py:120.
+
+3. DUPLICATE TRIGGERS CAN TERMINATE THE AUDIT WORKER
+Telemetry identifies duplicates but still forwards them into the pipeline.
+Audit then encounters either a duplicate database key or the merger's repeated-
+trigger rejection. The exception terminates the audit worker. This becomes
+relevant once finding 1 is fixed.
+Evidence: source inspection across telemetry dispatch, audit persistence and
+merger validation; not reproduced against a live database.
+References: control_service/mcu_link.py:603;
+inference_pipeline/engines/deduplication_engine.py:123;
+audit_write/supabase/migrations/20260915000000_init.sql
+(trigger_roll_camera_sequence_key).
+
+4. DASHBOARD EVENTS CAN BE LOST DESPITE REPLAY SUPPORT
+If the panel receives events 1 and 3, it advances its cursor to 3 without first
+recovering event 2. Its acknowledgement then deletes event 2 from the replay
+store. Queue overflow or interrupted delivery can expose this problem.
+Evidence: reproduced using PanelEventCursor and EventStore; acknowledging after
+receiving only events 1 and 3 left no event 2 available for replay.
+References: dashboard_service/operator_panel/client.py:152 and :628;
+dashboard_service/services/event_store.py (acknowledge).
+
+5. SERIAL WRITE FAILURES BYPASS COMMAND RETRIES
+The transport raises TransportError, but the sender catches only OSError and
+timeout errors. A disconnect escapes immediately instead of following the
+configured retry policy and returning the normal command-failure result.
+Evidence: reproduced with McuCommandSender and the actual TransportError class
+declaration loaded in isolation; one write was attempted with three configured.
+References: control_service/mcu_command.py:432;
+control_service/transport.py:115.
+
+6. A SLOW PANEL CAN REPEATEDLY INTERRUPT BROADCASTS TO OTHER PANELS
+Broadcasts send to connected sockets sequentially. The outer timeout cancels
+the broadcast without removing the stalled socket, so clients later in that
+iteration can repeatedly miss updates.
+Evidence: source inspection; no live slow-network reproduction performed.
+References: dashboard_service/routers/websocket.py:63;
+app_orchestrator.py (_send_panels).
+
+7. NORMAL UPTIME ROLLOVER IS REPORTED AS AN MCU REBOOT
+The wire uptime is a 16-bit value. Its normal 65535 -> 0 transition, approximately
+every 18.2 hours, triggers a false reboot event because any decrease is treated
+as a reboot.
+Evidence: reproduced with McuState.observe_uptime using 65535 followed by 0.
+Reference: control_service/mcu_state.py:365.
+
+8. SIGNED ENCODER TELEMETRY CONFLICTS WITH THE PIPELINE MODEL
+The wire decoder accepts negative encoder counts, but TriggerTelemetry rejects
+them because encoder_count has a nonnegative constraint. Reverse-motion handling
+needs an explicit policy; currently these triggers are rejected. This is a
+contract compatibility issue; supporting reverse-motion inspection may require
+additional changes beyond allowing signed values.
+Evidence: reproduced by constructing TriggerTelemetry with encoder_count=-5.
+References: frame_ingest_manager/models/trigger_telemetry.py:14;
+control_service/protocol.py:241.
+
+DOCUMENTED UNFINISHED FEATURES
+These are known implementation gaps, distinct from the bugs above:
+- End-of-roll finalization: open defect groups remain unfinalized at shutdown.
+  Audit deliberately does not interpret shutdown or pause as a physical roll end.
+- Restart recovery: open merge state and queued work are not durably recovered.
+- Live MVS camera ingestion: the current process runtime supports folder images.
+References: README.md; runtime/audit_worker.py:187;
+audit_write/services/audit_writer.py (start_roll); runtime/process_runtime.py.
+
+VALIDATION RESULTS
+- All 124 Python files found during the review parsed successfully.
+- 74 selected test methods passed.
+- Two folder-exhaustion tests failed because the source now loops through images
+  while the tests expect exhaustion. Whether looping is intended needs to be
+  settled before deciding whether to change the implementation or the tests.
+- The telemetry test produced errors in all three direction subcases: forward,
+  stopped and reverse, due to the 14-byte versus 19-byte mismatch.
+- Missing local dependencies included pyserial, asyncpg, SAHI and boto3.
+- The available Python reported 3.11.0b5, while pyproject.toml requests
+  Python >=3.10,<3.11.
+- The supplied configuration points to Jetson-only model and image paths.
+  The doctor command failed during configuration validation at
+  inference.model_path before reaching its diagnostics.
+- Full hardware, GPU, database and S3 integration testing remains unverified.
+
+TEST COMMANDS USED
+python -B -m unittest tests.test_telemetry_19
+python -B -m unittest tests.test_process_runtime tests.frame_ingest_manager tests.test_timing tests.test_gpu_monitor
+python -B -m unittest discover -s tests/frame_ingest_manager -t .
+python -B -m unittest tests.inference_pipeline.test_contracts tests.inference_pipeline.test_coordinate_mapper tests.inference_pipeline.test_four_point_grading_engine tests.inference_pipeline.test_tile_generator tests.test_config_logging
+
+The frame_ingest_manager package argument in the second command does not recurse
+into its tests; the separate discovery command ran those six test methods.
+Additional small checks ran in memory without editing source files.
+
+SUGGESTED FIRST INVESTIGATION
+Address the telemetry payload-length mismatch first, then examine command
+responsiveness, duplicate-trigger handling and dashboard replay integrity.

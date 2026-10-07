@@ -1,0 +1,10 @@
+asyncpg>=0.29
+pydantic>=2.6
+PyYAML>=6.0
+python-dotenv>=1.0
+boto3>=1.34
+
+# tests
+pytest>=8.0
+pytest-asyncio>=0.23
+pgserver>=0.1.4        # portable PostgreSQL for scripts/test_db.ps1

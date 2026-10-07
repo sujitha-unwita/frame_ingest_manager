@@ -1,0 +1,11 @@
+# Local credentials must never enter source control.
+.env
+
+# Python runtime caches.
+__pycache__/
+*.py[cod]
+
+# Application logs may contain operational data.
+logs/
+*.log
+.venv*

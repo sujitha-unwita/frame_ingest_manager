@@ -1,0 +1,21 @@
+# Test-tool settings only; the application loader does not read this file.
+# No database runner currently consumes these settings. Loading this YAML
+# does not create databases, apply migrations, or write smoke-test records.
+# Paths are relative to this file, not the process working directory.
+testing:
+  # A future runner must read this environment variable explicitly.
+  # Credentials stay outside YAML. Use only a disposable test environment.
+  database_url_env: TEXTILE_TEST_DATABASE_URL
+  database_prefix: idaview_test_
+  migrations_dir: ../audit_write/supabase/migrations
+  local_postgres:
+    data_dir: ../audit_write/.pgdata
+
+# Sample values for a deliberately invoked write/read/cleanup database test.
+smoke_test:
+  roll_label_prefix: SMOKE-ROLL-
+  camera_id_prefix: SMOKE-CAM-
+  frame_variant: smoke
+  defect_class: smoke_test
+  confidence: 0.9
+  model_version: smoke-test

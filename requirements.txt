@@ -1,0 +1,47 @@
+# VisionBar AGX service dependencies.
+#
+#     python3 -m pip install -r requirements.txt
+#
+# Ultralytics is pinned to the requested 8.4.0 release. Other versions remain
+# minimums; this file is not a tested platform-specific dependency lock.
+# On Jetson, install torch/torchvision builds matching JetPack before resolving
+# these requirements. A generic PyPI install does not establish CUDA support.
+
+# ---- required by every entry point ---------------------------------------
+python-dotenv>=1.0   # main loader reads the external audit password
+PyYAML>=6.0          # config/config_loader.py -- config.yaml parsing
+
+# ---- required for the REAL serial transport ------------------------------
+# The physical serial port is used when transport.kind is serial.
+#
+# NOTE: pyserial's latest release is 3.5 (Nov 2020). There has been no tagged
+# release since, despite active commits on master. If you hit a Python 3.13+
+# incompatibility on the Jetson, install from git rather than assuming a
+# newer release exists.
+pyserial>=3.5        # control_service/transport.py SerialTransport
+
+# ---- required for the dashboard service ----------------------------------
+fastapi>=0.110       # dashboard_service/app.py -- API and WebSocket endpoints
+uvicorn>=0.27        # app_orchestrator.py -- ASGI server
+websockets>=12.0     # dashboard_service/operator_panel/client.py
+pydantic>=2.0        # config/models.py -- typed YAML configuration models
+
+# ---- inference and audit dependencies for the serve command ---------------
+# Plain module-level imports require these even before capture starts.
+asyncpg>=0.29        # audit_write PostgreSQL adapter
+boto3>=1.34          # whole-frame S3 storage used by AuditWriter
+opencv-python>=4.8   # folder-frame image decoding for inference
+sahi>=0.12.6         # NumPy batched_nmm member-index API
+ultralytics==8.4.0   # YOLO backend loaded by SAHI (requested 8.4 release)
+numpy>=1.24          # global detection arrays passed to SAHI NMM
+torch>=2.0           # selected by the configured SAHI runtime
+
+# ---- deliberately NOT used ------------------------------------------------
+# pyserial-asyncio        Windows support is a polling fallback, not native
+#                         Proactor integration; the PR fixing that is unmerged.
+# pyserial-asyncio-fast   Actively maintained, but POSIX/macOS only per its
+#                         PyPI classifiers -- and development happens on
+#                         Windows while the target is a Jetson.
+#
+# transport.py uses plain pyserial with asyncio.to_thread instead, which
+# behaves identically on both platforms. See its module docstring.

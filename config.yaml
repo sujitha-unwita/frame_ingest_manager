@@ -1,0 +1,996 @@
+# =========================================================================
+# VisionBar AGX service configuration
+# =========================================================================
+#
+# ONE file. Every tunable in the service lives here, with its provenance.
+# No module hardcodes a threshold, a port name, a timeout or a baud rate.
+#
+# Loaded by   : config_loader.py -> ConfigLoader.load()
+# Consumed by : control_service/*, dashboard/*, simulator/*
+# Validated at: startup, BEFORE the serial port is opened, so a typo fails
+#               immediately naming the bad key rather than mid-run.
+#
+# YOU CAN DELETE ANY KEY. Every setting has a default declared beside its
+# type in config_loader.py, so a partial file still starts. What you CANNOT
+# do is misspell one: an unknown section or key is a hard error, because
+# `.get(key, {})` would turn a typo into a KeyError 100 ms into a run.
+#
+# See what actually got loaded, including defaults:
+#
+#     python config_loader.py
+#
+# Override the file : --config PATH        | $VISIONBAR_CONFIG
+# Override the port : --port DEVICE        | $VISIONBAR_SERIAL_PORT
+# Override transport: --mock / --real      | $VISIONBAR_TRANSPORT
+#
+# PROVENANCE MARKERS used throughout:
+#   [LLD]  specified by a design document, cited inline
+#   [OURS] our engineering choice, with the reasoning given
+#
+# -------------------------------------------------------------------------
+
+
+# =========================================================================
+# transport -- WHICH link the service talks to
+# =========================================================================
+#
+# Used by: control_service/mcu_link.py -> build_transport()
+#
+# A "transport" is simply the object that gives us bytes and takes our
+# bytes. It has four methods: open() / read() / write() / close().
+#
+# Two implementations exist, and McuLink cannot tell them apart:
+#
+#   serial  -> control_service/transport.py  SerialTransport   (real RS-422)
+#   mock    -> simulator/mock_mcu.py         MockMcu           (simulated)
+#
+# The mock emits REAL protocol bytes -- correct framing, correct CRC -- so
+# the parser, link logic and command retry exercised against it are the
+# same code that runs against the MCU. Only the byte source changes.
+#
+transport:
+
+  # serial | mock
+  kind: "serial"
+
+
+# =========================================================================
+# serial -- the physical RS-422 link, reached through a USB adapter
+# =========================================================================
+#
+# Used by: control_service/transport.py  (only when transport.kind == serial)
+#
+serial:
+
+  # Linux / Jetson : /dev/ttyUSB0 (FTDI) or /dev/ttyACM0 (CDC-ACM)
+  # Windows dev box: COM3, COM4, ...
+  #
+  # Find it on Linux with:  ls -l /dev/serial/by-id/
+  # PREFER the by-id path in production. /dev/ttyUSB0 is assigned in
+  # enumeration order and will point at a different adapter if two are
+  # plugged in, or if the hub enumerates differently after a reboot.
+  port: "/dev/ttyUSB0"
+
+  baud: 115200
+
+  # 8-N-1 per HW LLD v1.3 [LLD]. Translated to pyserial constants in
+  # control_service/transport.py -- this file stays free of Python.
+  bytesize: 8
+  parity: "N"        # N | E | O | M | S
+  stopbits: 1        # 1 | 1.5 | 2
+
+  # How long a blocking read waits with nothing arriving. Also bounds how
+  # fast McuLink.run() notices cancellation at shutdown, because the read is
+  # what it is parked on. [OURS]
+  read_timeout_s: 0.050
+
+  # A command frame is 7 bytes -- 0.6 ms on the wire at 115200 baud. A write
+  # that has not completed in 200 ms means the port is wedged, not busy.
+  write_timeout_s: 0.200
+
+  # POSIX only. Applies TIOCEXCL so a SECOND process opening this port fails
+  # loudly at open() instead of silently stealing half our bytes.
+  #
+  # WHY: a tty is a byte stream with ONE kernel buffer. Two readers do not
+  # each get a copy -- every byte goes to exactly one of them. A 13-byte
+  # heartbeat gets sliced 5/8 and NEITHER parser can decode it. Worse, the
+  # parser resyncs by scanning for STX (0x02), which appears constantly
+  # inside payloads, so a fragment can resync onto a false STX and pass the
+  # one-byte CRC by chance 1 time in 256 -- fabricating plausible telemetry,
+  # which is worse than losing it.
+  #
+  # Ignored on Windows, where the driver already enforces exclusivity and a
+  # second open fails with PermissionError(13, 'Access is denied').
+  #
+  # NOT a complete guarantee: TIOCEXCL does not apply retroactively and root
+  # is exempt. The real guarantee is that only McuLink opens the port.
+  exclusive: true
+
+  # Reconnect behaviour when the cable is pulled or the adapter
+  # re-enumerates. The service must survive that without a restart.
+  reconnect:
+    enabled: true
+    initial_delay_s: 0.5
+    max_delay_s: 5.0
+    # Applied after each failed attempt, capped at max_delay_s. Backing off
+    # stops a missing adapter from pinning a CPU core retrying open().
+    backoff_factor: 2.0
+
+  # FTDI USB latency timer, in ms. INFORMATIONAL -- the service reads the
+  # actual value at startup and warns if it disagrees; it does not set it
+  # (that needs root). See README "USB latency timer".
+  #
+  # Factory default is 16 ms, which aliases a perfect 100 ms beat into 96 ms
+  # and 112 ms arrival buckets and makes a healthy link read DEGRADED.
+  expected_latency_timer_ms: 2
+
+
+# =========================================================================
+# protocol -- HW LLD v1.3 S3.5.2 unified frame  [LLD]
+# =========================================================================
+#
+# Used by: control_service/mcu_link.py (parser), mcu_command.py, simulator/
+#
+# WIRE FORMAT. Must match the MCU firmware exactly. Changing one of these
+# without changing the firmware breaks every frame.
+#
+#   STX | MSG_TYPE | LEN | PAYLOAD | CRC8 | ETX
+#
+protocol:
+
+  # ---- frame delimiters -------------------------------------------------
+  #
+  #   STX | MSG_TYPE | LEN | PAYLOAD | CRC8 | ETX
+  #
+  # STX is also what the parser scans for to find a frame start after noise.
+  # It is 0x02, which appears constantly INSIDE payloads (state=2 is PAUSED,
+  # cmd_code 0x02 is resume, LEN=2 on every command frame) -- which is why a
+  # candidate frame is only accepted once ETX, LEN and CRC all agree.
+  stx: 0x02
+  etx: 0x03
+
+  # ---- message type codes, HW LLD S3.5.2 --------------------------------
+  message_types:
+    telemetry: 0x01
+    heartbeat: 0x02
+    command: 0x03
+    ack_nack: 0x04
+
+  # ---- exact payload length per type, HW LLD S3.5.2 ---------------------
+  #
+  # WIRE CONTRACT. A frame whose LEN disagrees is rejected, because the
+  # struct.unpack that follows would otherwise read past the payload or stop
+  # short and silently produce wrong field values.
+  #
+  #   telemetry  trigger_id(4) encoder_count(4, signed)
+  #              distance_mm_x1000(4, signed) timestamp_us(4)
+  #              direction(1, signed) state(1) flags(1)
+  #   heartbeat  timestamp_us(4) state(1) flags(1) uptime_s(2)
+  #   command    cmd_seq(1) cmd_code(1)
+  #   ack_nack   cmd_seq(1) cmd_code(1) result(1) state(1)
+  #
+  # A type NOT listed here is not length-checked -- S3.5.2 says LEN "lets
+  # both sides skip unrecognised future types", so an unknown type must stay
+  # skippable rather than become an error.
+  payload_lengths:
+    telemetry: 19
+    heartbeat: 8
+    command: 2
+    ack_nack: 4
+
+  # ---- status_flags bit positions, HW LLD -------------------------------
+  #
+  # Four fault bits in the status_flags byte carried by heartbeat and
+  # telemetry. panel_estop is NOT just another fault bit: HW LLD reserves it
+  # for the hardwired safety interlock, distinct from an operator pause
+  # (LLD SW S3.8: "not a substitute for a hardwired panic button"), which is
+  # why dashboard/events.py breaks it out as its own `estop_active` field.
+  status_flags:
+    strobe_fault: 0
+    encoder_fault: 1
+    overcurrent_trip: 2
+    panel_estop: 3
+
+  # ---- CRC-8, non-reflected, MSB-first ----------------------------------
+  crc:
+    poly: 0x07
+    init: 0x00
+    xorout: 0x00
+    # Whether the STX byte is covered by the checksum.
+    include_stx: true
+
+  # ---- resync guard -- NOT a message length -----------------------------
+  #
+  # The parser finds a candidate frame by scanning for STX. If the byte
+  # after a FALSE STX says LEN=200, the parser must not sit waiting for 205
+  # bytes that never come -- it declares that STX false and slips one byte.
+  #
+  # Must exceed every payload_lengths entry, with headroom for a future
+  # message type that this config does not yet name. [OURS]
+  max_payload: 64
+
+# =========================================================================
+# mcu_states -- HW LLD S3.5.3 state machine  [LLD]
+# =========================================================================
+#
+# Used by: control_service/mcu_state.py
+#
+# IMPORTANT: this state machine RUNS IN FIRMWARE. Our McuState class only
+# OBSERVES it -- it reads the `state` byte off the wire and remembers it.
+# We never compute a transition. If we ran our own copy it could disagree
+# with the MCU's, and ours would be the wrong one.
+#
+# Firmware transitions, for reference (HW LLD S3.5.3):
+#   IDLE          -> RUNNING  on RESUME, ACK'd
+#   RUNNING       -> PAUSED   on PAUSE, graceful (finishes in-flight trigger)
+#   RUNNING/PAUSED-> FAULT    autonomously on any fault bit, immediate
+#   FAULT         -> RUNNING  on RESUME **AND** fault bits clear (both)
+#
+# =========================================================================
+# encoder -- HW LLD S3.3
+# =========================================================================
+#
+# Used by: control_service/mcu_link.py (debug log), simulator/mock_mcu.py
+#
+# HW LLD S3.3, verbatim: "MCU decode: TIM2 (32-bit timer) in hardware encoder
+# mode, x4 quadrature decoding -> 2000 counts/revolution -> 0.1mm/count.
+# Trigger threshold: 287.45mm / 0.1mm/count = 2874.5 -> rounded to 2875
+# counts (287.5mm, +0.017% over nominal)."
+#
+# 500 PPR encoder x4 quadrature = 2000 counts/rev, on a 200mm measuring
+# wheel -> 0.1 mm per count. [LLD]
+#
+# NOTE S3.3 flags the wheel circumference as an OPEN ITEM: "wheel
+# circumference has manufacturing tolerance and must be bench-calibrated
+# against a known fabric length before the counts-per-trigger constant is
+# locked." Re-derive both numbers after that calibration.
+encoder:
+  mm_per_count: 0.1             # [LLD] HW LLD S3.3
+  counts_per_trigger: 2875      # [LLD] HW LLD S3.3
+
+
+mcu_states:
+  idle: 0
+  running: 1
+  paused: 2
+  fault: 3
+
+  # [OURS -- Pooja] NOT in HW LLD S3.5.3, which defines codes 0-3 only.
+  # Self-checked and healthy, waiting for START CAPTURE from the dashboard.
+  # Firmware must send 4 for this to ever be observed; until then the MCU
+  # reports IDLE and the armed flow never runs.
+  armed: 4
+
+
+# =========================================================================
+# heartbeat -- HW LLD S3.5.2 cadence, LLD SW S3.8a health
+# =========================================================================
+#
+# Used by: control_service/heartbeat_receiver.py, simulator/mock_mcu.py
+#
+heartbeat:
+
+  # The MCU emits a beat every 100 ms from a hardware timer. [LLD]
+  interval_s: 0.100
+
+  # -------------------------------------------------------------------
+  # (A) LINK HEALTH -- measured on HOST ARRIVAL time
+  # -------------------------------------------------------------------
+  #
+  # WHAT THIS MEASURES:  "how STALE is my information about the MCU?"
+  # WHAT IT DOES NOT:    it cannot tell a LATE beat from a LOST one.
+  #
+  # age = NOW - (arrival time of the last beat)
+  #
+  # Note `age` grows on its own -- nothing has to arrive. That is exactly
+  # how a disconnected cable is detected: the stored arrival time stops
+  # moving while the clock keeps going.
+  #
+  # Bands are [upper bound in heartbeat intervals, state name]. The first
+  # band the age falls under wins; past every bound is LINK_DOWN. They are
+  # MULTIPLES of interval_s, not absolute ms, so changing interval_s above
+  # rescales the whole table at once. Comparison is `<`, so the bands
+  # partition the number line with no gaps and no overlaps:
+  #
+  #     age <  100 ms  -> LINK_UP
+  #     age <  200 ms  -> LINK_DEGRADED   missed_intervals = 1
+  #     age <  300 ms  -> LINK_DEGRADED   missed_intervals = 2
+  #     age >= 300 ms  -> LINK_DOWN
+  #
+  # LLD SW S3.8a, verbatim [LLD]:
+  #   "LINK_UP (heartbeat within 1x 100ms interval) / LINK_DEGRADED
+  #    (1-2 missed) / LINK_DOWN (>=3 missed, 300ms)"
+  #   Rationale: "300ms is faster than one trigger interval at every
+  #   committed speed (492.8-574.9ms) -- link death is detected before a
+  #   second missed trigger would even be noticed"
+  #
+  # NOTE ON THE WORD "missed": the document says "1-2 missed", but the
+  # mechanism it defines measures ELAPSED TIME, not misses. LINK_DEGRADED
+  # means "one interval's worth of time passed with nothing arriving" --
+  # not "a beat was destroyed". Section (B) below answers that question.
+  bands:
+    - [1.0, "LINK_UP"]
+    - [2.0, "LINK_DEGRADED"]
+    - [3.0, "LINK_DEGRADED"]
+
+  # How often the link state is evaluated. [OURS]
+  #
+  # This runs on its OWN TIMER, deliberately not on frame arrival. Two
+  # reasons, both load-bearing:
+  #
+  #  1. A totally dead link produces NO frames. If the check were triggered
+  #     by arriving data, the one failure it exists to detect could never
+  #     be reported -- the panel would sit on LINK_UP forever.
+  #
+  #  2. Checking after each frame biases the sample. Measured over 6 s of
+  #     mock traffic: checks after a heartbeat saw age 0.0 ms every time
+  #     (trivially UP); checks after a telemetry frame saw 95-113 ms. The
+  #     samples were "0, 0, 0, 95, 0, 0, 112, 0..." -- almost never at a
+  #     representative moment. A fixed cadence samples evenly.
+  #
+  # 50 ms = half the beat interval: fast enough that LINK_DOWN is reported
+  # within 50 ms of crossing 300 ms, against S3.8a's ~190 ms of slack
+  # before one trigger interval elapses.
+  check_interval_s: 0.050
+
+  # Consecutive checks a NEW state must hold before it is published. [OURS]
+  #
+  # THIS IS THE FLICKER FIX, and it deliberately does NOT move the band.
+  #
+  # A beat that arrives 112 ms late pushes the age past 100 ms for about
+  # 12 ms before the beat lands and resets it to 0. That is a real crossing
+  # but not a real fault -- nothing was missed, one frame was just late.
+  #
+  #   late beat:  t=100 DEGRADED (1st)  t=112 beat lands, UP (2nd) -> dropped
+  #   dead link:  t=100 DEGRADED (1st)  t=150 DEGRADED    (2nd) -> published
+  #
+  # Why debounce instead of widening the band: measured gap distribution on
+  # the mock was bimodal -- 72 gaps in 95-100 ms and 26 in 110-115 ms, with
+  # an empty valley between. Widening to 100.999 ms moved exactly ONE gap
+  # out of 120. Clearing it by widening needs 115 ms, a 15% deviation from
+  # a spec that says 1x, adopted to hide a Windows scheduler artifact that
+  # will not exist on the Jetson. Debounce rejects a transient crossing of
+  # ANY size, whatever the jitter distribution turns out to be on real
+  # hardware, and keeps the threshold exactly where S3.8a puts it.
+  #
+  # Cost: 50 ms of extra reporting latency. 1 disables debouncing.
+  debounce_samples: 2
+
+  # LINK_DOWN is published on the FIRST check, bypassing the debounce.
+  # A dead link must never wait for confirmation. [OURS]
+  debounce_exempt_down: true
+
+  # -------------------------------------------------------------------
+  # (B) DROPPED BEATS -- measured on the MCU'S OWN CLOCK
+  # -------------------------------------------------------------------
+  #
+  # WHAT THIS MEASURES:  "was a beat ACTUALLY lost?"
+  # WHEN IT CAN ANSWER:  only once the NEXT beat arrives (retrospective).
+  #
+  # Completely independent of section (A). The MCU writes timestamp_us
+  # BEFORE the frame ever reaches USB, so this is immune to USB latency
+  # batching and to host scheduling. Arrival time is not.
+  #
+  #   delta = this_stamp - previous_stamp
+  #   perfect beat  -> 100,000 us
+  #   real beat     -> ~99,800 to ~100,300 us (the MCU builds the frame in
+  #                    software just after the timer fires -- HW LLD S3.5.4
+  #                    puts heartbeat generation on a LOW-priority timer)
+  #   one lost beat -> 200,000 us
+  #
+  # HEARTBEATS CARRY NO SEQUENCE NUMBER. HW LLD S3.5.2's payload is
+  # timestamp_us(4) | state(1) | status_flags(1) | uptime_s(2) -- there is
+  # no counter to check for gaps, unlike telemetry's trigger_id. Comparing
+  # timestamps is the ONLY way to detect a missing beat.
+
+  # Report clock drift between the MCU crystal and the AGX crystal. [OURS]
+  #
+  # A DIAGNOSTIC, not a dashboard field. LLD SW S3.9's event table has no
+  # clock_drift event and nothing pushes this to the operator.
+  #
+  # It exists to answer LLD SW S5.3's MV1 validation item [LLD]:
+  #   "confirm the MCU/AGX Orin clock drift is small enough over a
+  #    multi-hour bench run to not require active correction"
+  #
+  # Read it from GET /health or the shutdown log after a long bench run.
+  # ppm = parts per million; 1 ppm = 1 microsecond of error per second, so
+  # a 50 ppm crystal drifts 180 ms per hour. Two crystals each +/-50 ppm
+  # can differ by 100 ppm.
+  #
+  # Needs this many beats before reporting a number -- a short sample gives
+  # a meaningless ratio dominated by single-frame jitter.
+  drift_min_samples: 600
+
+
+# =========================================================================
+# commands -- LLD SW S3.8a operator control path  [LLD]
+# =========================================================================
+#
+# Used by: control_service/mcu_command.py
+#
+commands:
+
+  # Wait for an ACK matching BOTH our sequence number and our command code
+  # before retrying. S3.8a specifies "150-200ms ACK timeout, retry x3".
+  ack_timeout_s: 0.200
+
+  # TOTAL sends, not retries-after-the-first.
+  #
+  # WORST CASE: 3 x 200 ms = 600 ms before a command is declared failed.
+  # This is exactly why the ACK wait is a QUEUE SUBSCRIPTION and not a port
+  # read. Reading the port for 600 ms would swallow 6 heartbeats and drive
+  # link_state to LINK_DOWN every single time an operator pressed pause.
+  max_attempts: 3
+
+  # The `result` byte value meaning success. Anything else is a NACK.
+  ack_result_ok: 0
+
+  # Commands the dashboard may send, mapped to the wire code point.
+  # Cross-checked at startup against visionbar_protocol.COMMAND_CODES -- a
+  # mismatch here would put a byte on the wire the MCU will NACK. [LLD]
+  codes:
+    pause: 0x01
+    resume: 0x02
+    stop: 0x03
+
+
+# =========================================================================
+# dashboard -- LLD SW S3.9 data contract, S3.8 control path  [LLD]
+# =========================================================================
+#
+# Used by: dashboard/dashboard_ws.py, dashboard/dashboard_mirror.py,
+#          dashboard/dashboard_client.py
+#
+dashboard:
+
+  host: "0.0.0.0"
+  port: 8000
+  ws_path: "/ws/dashboard"
+
+  # S3.8a "Dashboard heartbeat mirroring": system_status pushed on its own
+  # 500ms-1s timer, "not only when a new event exists". [LLD]
+  #
+  # WHY ITS OWN TIMER: an opportunistic push tied to defect events goes
+  # silent exactly when the pipeline stalls -- the moment the operator most
+  # needs to see something is wrong.
+  status_push_interval_s: 0.5
+
+  # Client-side watchdog. Three missed pushes and the panel declares its own
+  # display stale -- the same 3-interval rule the AGX applies to the MCU
+  # heartbeat, one layer up. [OURS]
+  #
+  # WHY: without it, a dead AGX leaves the panel showing the last numbers it
+  # received forever. The operator sees LINK_UP, healthy duty cycle and no
+  # defects, and concludes the fabric is clean -- when nothing is being
+  # inspected at all. Silence has to be visible.
+  client_status_timeout_s: 3.0
+  client_status_check_interval_s: 0.5
+  client_reconnect_delay_s: 2.0
+
+  # HTTP fallback is a SERVER CAPABILITY, not a mode switch.  When available,
+  # the panel automatically starts using these routes only after its WebSocket
+  # connection fails or becomes stale, and returns to WebSocket when it
+  # reconnects.  [OURS]
+  fallback:
+    available: true
+
+  # Single-panel, in-memory replay queue for discrete dashboard events while
+  # WebSocket is unavailable.  The panel acknowledges processed event IDs, so
+  # acknowledged events are removed.  This capacity is an emergency bound for
+  # a long outage, not a replacement for durable event storage.  [OURS]
+  events_store:
+    max_pending_events: 1000
+
+  # Expose GET /health. [OURS]
+  #
+  # NOT used by the dashboard -- the panel receives everything over the
+  # WebSocket. This is for `curl` during bench runs (see heartbeat
+  # .drift_min_samples above) and for a container/systemd healthcheck.
+  # Set false to remove the route entirely.
+  enable_health_endpoint: true
+
+
+# =========================================================================
+# simulator -- the fake MCU, for development without hardware
+# =========================================================================
+#
+# Used by: simulator/mock_mcu.py   (only when transport.kind == mock)
+#
+simulator:
+
+  # Approximate trigger interval at the 30 m/min committed floor. HLD S4.4
+  # gives 492.8-574.9 ms; 0.5 s is the round number in that range. [LLD]
+  trigger_interval_s: 0.575
+
+  # Fabric travel between two consecutive triggers, in mm. HLD S4.4. [LLD]
+  trigger_spacing_mm: 287.45
+
+  # Encoder counts added per trigger. HW LLD S3.3 gives 2875 (287.5mm at
+  # 0.1mm/count). Was 200 -- that was OURS and wrong by 14x. [LLD]
+  encoder_counts_per_trigger: 2875
+
+  initial_uptime_s: 0
+
+  # Which state the mock boots into. "armed" exercises the START CAPTURE
+  # flow: the mock sits in ARMED until a RESUME arrives, exactly as the
+  # firmware is being asked to. "running" is the old behaviour -- triggers
+  # start immediately, useful when testing telemetry alone. [OURS -- Pooja]
+  initial_state: "armed"
+
+  # Fault injection for testing. 0 disables.
+  #   drop_acks     : swallow this many ACKs, exercising command retry
+  #   drop_triggers : skip this many trigger_ids, exercising the
+  #                   missed_trigger_alarm path
+  drop_acks: 0
+  drop_triggers: 0
+
+
+
+
+# =========================================================================
+# gpu_monitoring -- real device-wide GPU activity from Jetson tegrastats
+# =========================================================================
+#
+# Owned by AppOrchestrator; duty_cycle is the last inference's mean (0..100).
+# These are samples of the whole GPU, not process-specific kernel timings.
+#
+gpu_monitoring:
+  enabled: true
+  executable: tegrastats
+  sample_interval_ms: 100
+  # The average stays until the next inference ends; no samples means null.
+  stop_timeout_s: 2.0
+
+
+# =========================================================================
+# audit_write -- PostgreSQL audit persistence (integration configuration)
+# =========================================================================
+#
+# The YAML contains deployment settings, but no password.  The separate local
+# .env file supplies the variable named by password_env.  It is ignored by
+# Git; create it from .env.example before audit persistence is enabled.
+#
+audit_write:
+  # One roll per capture session; completion/restart recovery remain backlog.
+  roll_label_prefix: "ROLL-"
+  frame_key_kind: whole_frame
+  model_version: null
+  # Enable only after the database is provisioned and migrations are applied.
+  enabled: True
+  database:
+    driver: "postgresql"
+    host: "aws-0-ap-northeast-1.pooler.supabase.com"
+    port: 5432
+    database_name: "postgres"
+    username: "postgres.ldlpcefudckrcwgbindw"
+    password_env: "TEXTILE_AUDIT_DB_PASSWORD"
+    environment_file: ".env"
+    ssl_mode: "require"
+    connect_timeout_s: 5.0
+
+    schema_name: "public"
+    application_name: idaview-backend
+    statement_timeout_ms: 30000
+    statement_cache_size: 0
+    decode_json: true
+    pool:
+      min_size: 2
+      max_size: 100
+      command_timeout_s: 60
+      max_inactive_connection_lifetime_s: 300
+      acquire_timeout_s: 10
+
+  migrations:
+    # Supabase CLI owns this history. Startup checks it but never modifies it.
+    history_schema: supabase_migrations
+    history_table: schema_migrations
+    version_column: version
+    required_versions: ["20260915000000", "20260924000000", "20260924000001"]
+
+  pagination:
+    default_limit: 50
+    max_limit: 500
+
+  # ---------------------------------------------------------------------------
+  # Tables
+  #
+  #   table         the real table name in Postgres
+  #   primary_key   the primary-key column
+  #   order_by      NOT NULL column lists are sorted by (newest first); the
+  #                 primary key breaks ties, so cursor pagination is stable
+  #   columns       every column the application may read or write — anything
+  #                 not listed is rejected before a query is built
+  #   read_only     columns the database fills in; callers may not update them
+  #   roles         named columns that repository functions refer to, so no
+  #                 column name is written inside the code
+  # ---------------------------------------------------------------------------
+  tables:
+    roll:
+      table: roll
+      primary_key: roll_id
+      order_by: started_at
+      columns:
+        - roll_id
+        - roll_label
+        - started_at
+        - ended_at
+        - length_mm
+        - suspect
+        - suspect_reason
+      read_only: [roll_id]
+      roles:
+        label: roll_label
+        ended_at: ended_at
+        length: length_mm
+        suspect_flag: suspect
+        suspect_reason: suspect_reason
+
+    camera:
+      table: camera
+      primary_key: camera_id
+      order_by: camera_id
+      columns:
+        - camera_id
+        - active
+      read_only: []
+      roles:
+        active_flag: active
+
+    trigger:
+      table: trigger
+      primary_key: trigger_primary_id
+      order_by: captured_at
+      columns:
+        - trigger_primary_id
+        - roll_id
+        - camera_id
+        - trigger_sequence
+        - encoder_count
+        - captured_at
+      read_only: [trigger_primary_id]
+      roles:
+        roll: roll_id
+        camera: camera_id
+        sequence: trigger_sequence
+
+    media:
+      table: media
+      primary_key: media_id
+      order_by: captured_at
+      columns:
+        - media_id
+        - roll_id
+        - trigger_primary_id
+        - camera_id
+        - frame_variant
+        - media_ref
+        - uploaded_at
+        - captured_at
+        - defect_id
+      read_only: [media_id]
+      roles:
+        roll: roll_id
+        trigger: trigger_primary_id
+        camera: camera_id
+        storage_key: media_ref
+        uploaded_at: uploaded_at
+        defect: defect_id
+
+    defect_live:
+      table: defect_live
+      primary_key: detection_id
+      order_by: captured_at
+      columns:
+        - detection_id
+        - roll_id
+        - trigger_primary_id
+        - encoder_count
+        - camera_id
+        - frame_variant
+        - media_id
+        - tile_ids
+        - defect_class
+        - confidence
+        - bbox_x1_px
+        - bbox_y1_px
+        - bbox_x2_px
+        - bbox_y2_px
+        - world_x1_mm
+        - world_y1_mm
+        - world_x2_mm
+        - world_y2_mm
+        - model_version
+        - detector_meta
+        - defect_id
+        - captured_at
+      read_only: [detection_id]
+      roles:
+        roll: roll_id
+        trigger: trigger_primary_id
+        media: media_id
+        defect: defect_id
+
+    defect_final:
+      table: defect_final
+      primary_key: defect_id
+      order_by: inserted_at
+      columns:
+        - defect_id
+        - roll_id
+        - defect_no
+        - defect_class
+        - confidence
+        - world_x1_mm
+        - world_y1_mm
+        - world_x2_mm
+        - world_y2_mm
+        - defect_area_mm2
+        - four_point_score
+        - inserted_at
+      read_only: [defect_id, inserted_at]
+      roles:
+        roll: roll_id
+        number: defect_no
+
+  # ---------------------------------------------------------------------------
+  # Validation used by the Pydantic models in audit_write/models/.
+  # An empty list means "accept any value".
+  # ---------------------------------------------------------------------------
+  validation:
+    confidence_min: 0.0
+    confidence_max: 1.0
+    frame_variants: []
+    defect_classes: []
+    camera_id_max_length: 64
+    label_max_length: 128
+
+  # ---------------------------------------------------------------------------
+  # AWS S3 — images.  The database stores only the object key (media.media_ref).
+  # ---------------------------------------------------------------------------
+  storage:
+    bucket: "visionbar-dev-images"
+    region: "ap-south-1"
+    # Leave empty for AWS.  Set for S3-compatible stores (MinIO, LocalStack).
+    endpoint_url: ""
+    client:
+      max_pool_connections: 50
+      connect_timeout_s: 5
+      read_timeout_s: 30
+      retry_max_attempts: 5
+      retry_mode: adaptive
+    # Bytes per chunk when streaming an object back through the API.
+    stream_chunk_size: 65536
+    default_content_type: application/octet-stream
+    # Key formats.  Placeholders are filled by storage.keys.build_key(kind, ...).
+    # Old keys are never rewritten, so change a template only by adding a new
+    # kind — never by editing one already in use.
+    keys:
+      # Folder images are uploaded unchanged. Match ext/content_type to their
+      # encoded format; no cropping or image conversion is performed.
+      whole_frame:
+        template: "{prefix}/{roll_id}/{camera_id}/{media_id}.{ext}"
+        prefix: frames
+        ext: jpg
+        content_type: image/jpeg
+      media:
+        template: "{prefix}/{captured_at:%Y/%m/%d}/{roll_label}/seq-{trigger_sequence:06d}-{camera_id}-{frame_variant}.{ext}"
+        prefix: crops
+        ext: jpg
+        content_type: image/jpeg
+
+
+# =========================================================================
+# inference -- real folder-to-defect pipeline settings
+# =========================================================================
+#
+# A model file is required; null below must be replaced before startup.
+# Use an absolute path (relative paths resolve from the working directory).
+# All values that
+# affect detection, mapping, merging, or numbering live here rather than in
+# Python modules.
+#
+inference:
+  engine_kind: "sahi"
+  model_path: "/home/orin_nano/projects/textile-defect/Hikrobot_inference/full_camera_inference_fixed_buffer_v1/models/best_Hikrobot_yolo11m.engine"
+  model_type: "ultralytics"
+  device_preference: "cuda:0"
+  confidence_threshold: 0.25
+  tile_size_px: 1216
+  tile_overlap_ratio: 0.15
+  tile_batch_size: 1
+  sahi_postprocess_type: "NMM"
+  sahi_match_metric: "IOS"
+  postprocess_class_agnostic: false
+  # Tile merging is independent of cross-camera/trigger deduplication.
+  sahi_match_threshold: 0.5
+  # Must match the exported engine. 1 = grayscale; 3 = RGB.
+  # Retains the previous colour input until the engine contract is confirmed.
+  input_channels: 1
+  normalization_divisor: 255.0
+  padding_value: 0
+  # Ultralytics per-tile prediction settings, before SAHI merging.
+  prediction_iou_threshold: 0.7
+  prediction_max_detections: 300
+  prediction_class_agnostic: false
+  prediction_verbose: false
+  # All batches, including the last and startup warmup, use tile_batch_size.
+  # Missing last-batch entries are padded and their predictions discarded.
+
+  layout:
+    horizontal_overlap_ratio: 0.10
+    vertical_overlap_ratio: 0.15
+    # Vertical GSD: 338.18 mm / 3072 px, rounded to 110.1 micrometres/px.
+    mm_per_pixel_y: 0.1101
+    # Horizontal GSD: 463.02 mm / 4096 px, rounded to 113.0 micrometres/px.
+    mm_per_pixel_x: 0.1130
+    origin: "top_left"
+    # Physical slots on the bar, independent of the active camera list.
+    # If MV1 uses cameras 3 and 4, select those IDs under frame_ingest.camera_ids.
+    camera_position_indices:
+      camera_1: 0
+      camera_2: 1
+      camera_3: 2
+      camera_4: 3
+      camera_5: 4
+      camera_6: 5
+    # Full sensor/frame width, NOT the SAHI tile size. All active cameras match.
+    frame_width_px: 4096
+    # Inspection boundaries are the outer edges of the active cameras' combined
+    # coverage, minus these stencils once. Everything inside is assumed fabric.
+    # Initial stencil choice: 50 mm each side; use 100 if mounted that way.
+    left_stencil_mm: 50.0
+    right_stencil_mm: 50.0
+
+  grading:
+    # Project poster policy, not a claim of ASTM compliance.
+    # Score the longest dimension of the settled rectangle, converted to inches.
+    mm_per_inch: 25.4
+    length_limits_inches: [3.0, 6.0, 9.0]
+    length_points: [1, 2, 4]
+    # The poster omits >9 inches; use 4 points for that range as well.
+    oversize_points: 4
+    # Match your model's actual labels (case-insensitive, exact names).
+    hole_classes: ["hole", "small_hole", "large_hole"]
+    hole_points: 4
+    # Full width means both edges of the configured ACTIVE fabric area,
+    # not both edges of an individual camera image or the active camera set.
+    full_width_points: 4
+    full_width_tolerance_mm: 0.0
+
+  deduplication:
+    # NMM is class-aware; the threshold below applies to this chosen metric.
+    match_metric: "IOS"
+    ios_threshold: 0.5
+    horizontal_gap_px: 25.0
+    vertical_gap_px: 25.0
+    min_axis_overlap_ratio: 0.25
+
+
+# =========================================================================
+# logging
+# =========================================================================
+#
+# Used by: main.configure_logging(), control_service/mcu_link.py
+#
+logging:
+  # Separate timing CSV per process/run; normal logs keep their existing files.
+  timing_enabled: true
+  timing_file: "logs/timings/timing-{timestamp}-{process}-{pid}.csv"
+  level: "INFO"       # DEBUG | INFO | WARNING | ERROR | CRITICAL
+
+  # Third-party loggers held at this level even when `level` is DEBUG.
+  #
+  # WHY: `level: DEBUG` turns on DEBUG for EVERY library too, and uvicorn and
+  # websockets then log each frame they send and receive. That buries the
+  # control_service.* lines -- the ones about the MCU -- under WebSocket
+  # traffic that has nothing to do with the link.
+  #
+  # "uvicorn.error" is uvicorn's logger NAME, not an error level. Uvicorn
+  # routes ALL of its output through it, including INFO and DEBUG.
+  #
+  # INFO keeps the useful startup lines ("Uvicorn running on ...") and drops
+  # the per-frame chatter. Set to "DEBUG" to see everything again. [OURS]
+  quiet_loggers:
+    uvicorn.error: "INFO"
+    uvicorn.access: "INFO"
+    websockets: "INFO"
+    websockets.client: "INFO"
+    websockets.server: "INFO"
+    asyncio: "INFO"
+
+  # Console + file, relative to this YAML's directory. null = console only.
+  # A new timestamped file per startup preserves previous runs.
+  # --log-file overrides this path; {timestamp} works in that option too.
+  # Pre-validation diagnostics remain on the console, before this is configured.
+  # No size rotation/retention yet: monitor disk usage during long DEBUG runs.
+  file: "logs/visionbar-{timestamp}.log"
+  file_mode: "x"  # x refuses overwrite; a appends; w overwrites an existing file.
+  file_encoding: "utf-8"
+  filename_datefmt: "%Y%m%d-%H%M%S-%f"
+  # Logger name is the full module path; funcName identifies the emitting
+  # method/function automatically. No per-method formatter is needed.
+  format: "%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)s.%(funcName)s:%(lineno)d | %(message)s"
+  datefmt: "%Y-%m-%d %H:%M:%S"
+
+  # How often parser health counters are logged.
+  #
+  # WHAT TO LOOK FOR: on a healthy link with a SINGLE reader every counter
+  # stays at ZERO. A rising discarded_bytes is the signature of a second
+  # process reading the same port -- the exact failure this design exists
+  # to prevent, made visible.
+  counter_report_interval_s: 30.0
+
+
+# Process capacities count complete triggers, not images or bytes.
+# Tune deadlines against measured Jetson inference and network latency.
+processing:
+  trigger_queue_capacity: 4
+  audit_queue_capacity: 4
+  command_queue_capacity: 4
+  event_queue_capacity: 256
+  panel_queue_capacity: 256
+  poll_interval_s: 0.05
+  queue_put_timeout_s: 2.0
+  startup_timeout_s: 120.0
+  roll_timeout_s: 30.0
+  health_timeout_s: 10.0
+  vision_job_timeout_s: 30.0
+  audit_job_timeout_s: 60.0
+  shutdown_timeout_s: 60.0
+  terminate_timeout_s: 3.0
+  panel_send_timeout_s: 1.0
+
+frame_ingest:
+  source_kind: "mvs"                        # OPTIONS: "folder" | "mvs"
+  folder_path: '/opt/MVS/bin/Temp/Data'
+  camera_ids: ["camera_4"]
+  expected_camera_count: 1                  # RANGE: 1-6 
+
+  mvs:
+    sdk:
+      mvimport_dir: frame_ingest_manager/frame_sources/mvs/MvImport
+      transport_layers: [gige]
+      access_mode: exclusive
+      finalize_on_stop: true
+    # REQUIRED: verify counters at the SAME physical pulse before live capture.
+    trigger_id_base: 1
+    sequence_source: frame_number
+    slots_per_camera: 16
+    max_total_memory_mb: 512
+    bundle_timeout_s: 1.0
+    trigger_features:
+      TriggerSelector: FrameBurstStart
+      TriggerMode: "On"
+      TriggerSource: Line0
+      TriggerActivation: RisingEdge
+      TriggerDelay: 0.0
+    cameras:
+      # Initial order follows standalone cam0/cam1. Verify physical positions.
+      # - id: camera_3
+      #   serial_number: "DB2239178"
+      #   frame_number_base: 1
+      #   features:
+      #     ExposureMode: Timed
+      #     AutoExposureTimeUpperLimit: 10000
+      #     AutoExposureTimeLowerLimit: 26
+      #     ExposureAuto: Continuous
+      #   optional_features:
+      #     TriggerCacheEnable: false
+      #     OverlapMode: "On"
+      #     ExposureTimeMode: Standard
+      #     HDREnable: false
+      #     FullFrameTransmission: false
+      - id: camera_4
+        serial_number: "DB2239179"
+        frame_number_base: 1
+        features:
+          ExposureMode: Timed
+          AutoExposureTimeUpperLimit: 10000
+          AutoExposureTimeLowerLimit: 26
+          ExposureAuto: Continuous
+        optional_features:
+          TriggerCacheEnable: false
+          OverlapMode: "On"
+          ExposureTimeMode: Standard
+          HDREnable: false
+          FullFrameTransmission: false
